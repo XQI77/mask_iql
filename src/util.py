@@ -164,3 +164,21 @@ class Log:
         self.txt_file.close()
         if self.csv_file is not None:
             self.csv_file.close()
+
+class NormalizedEnv(gym.Wrapper):
+    def __init__(self, env, mean, std):
+        super().__init__(env)
+        # 确保 mean/std 是 numpy array
+        self.mean = mean.cpu().numpy() if torch.is_tensor(mean) else mean
+        self.std = std.cpu().numpy() if torch.is_tensor(std) else std
+        self.mean = self.mean.reshape(-1) # 展平
+        self.std = self.std.reshape(-1)
+        
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+        return (obs - self.mean) / self.std
+
+    def step(self, action):
+        next_obs, reward, done, info = self.env.step(action)
+        norm_next_obs = (next_obs - self.mean) / self.std
+        return norm_next_obs, reward, done, info

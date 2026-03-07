@@ -10,13 +10,29 @@ from tqdm import trange
 from src.iql import ImplicitQLearning
 from src.policy import GaussianPolicy, DeterministicPolicy
 from src.value_functions import TwinQ, ValueFunction
-from src.util import return_range, set_seed, Log, sample_batch, torchify, evaluate_policy
+from src.util import return_range, set_seed, Log, sample_batch, torchify, evaluate_policy, NormalizedEnv
 
 
 def get_env_and_dataset(log, env_name, max_episode_steps):
     env = gym.make(env_name)
     dataset = d4rl.qlearning_dataset(env)
 
+    # === [关键修改] 计算均值和标准差 ===
+    obs = dataset['observations']
+    # keepdims=True 保持形状为 (1, obs_dim)，方便广播
+    obs_mean = obs.mean(axis=0, keepdims=True)
+    obs_std = obs.std(axis=0, keepdims=True) + 1e-3  # 加上 1e-3 防止除以 0
+    
+    # === [关键修改] 对数据集进行归一化 ===
+    dataset['observations'] = (dataset['observations'] - obs_mean) / obs_std
+    dataset['next_observations'] = (dataset['next_observations'] - obs_mean) / obs_std
+    
+    # 打印统计信息，确认归一化生效
+    log(f'State Normalization Applied.')
+    log(f'Mean (first 3 dims): {obs_mean[0][:3]}')
+    log(f'Std  (first 3 dims): {obs_std[0][:3]}')
+    
+    # 处理 Reward (保持原有逻辑)
     if any(s in env_name for s in ('halfcheetah', 'hopper', 'walker2d')):
         min_ret, max_ret = return_range(dataset, max_episode_steps)
         log(f'Dataset returns have range [{min_ret}, {max_ret}]')
@@ -25,10 +41,13 @@ def get_env_and_dataset(log, env_name, max_episode_steps):
     elif 'antmaze' in env_name:
         dataset['rewards'] -= 1.
 
+    # 转为 Tensor
     for k, v in dataset.items():
         dataset[k] = torchify(v)
 
-    return env, dataset
+    # 返回 obs_mean 和 obs_std 供后续使用
+    # 注意：squeeze() 去掉多余的维度，变回 (obs_dim,)
+    return env, dataset, obs_mean.squeeze(), obs_std.squeeze()
 
 # [MODIFIED] 新增一个评估用的 Wrapper，把 Encoder 和 Policy 包装在一起
 class MaskedPolicyWrapper(torch.nn.Module):
@@ -48,9 +67,15 @@ def main(args):
     log = Log(Path(args.log_dir)/args.env_name, vars(args))
     log(f'Log dir: {log.dir}')
 
-    env, dataset = get_env_and_dataset(log, args.env_name, args.max_episode_steps)
+    # [修改 1] 接收 mean 和 std
+    env, dataset, obs_mean, obs_std = get_env_and_dataset(log, args.env_name, args.max_episode_steps)
+    
+    # [修改 2] 包装环境，确保 evaluate_policy 看到的是归一化后的状态
+    # 注意：env.seed() 应该在 wrap 之前调用，或者 wrap 之后确保传递
+    env = NormalizedEnv(env, mean=obs_mean, std=obs_std)
+
     obs_dim = dataset['observations'].shape[1]
-    act_dim = dataset['actions'].shape[1]   # this assume continuous actions
+    act_dim = dataset['actions'].shape[1]
     set_seed(args.seed, env=env)
 
     # [MODIFIED] 1. 定义 Latent Dimension
@@ -60,26 +85,7 @@ def main(args):
         policy = DeterministicPolicy(embedding_dim, act_dim, hidden_dim=args.hidden_dim, n_hidden=args.n_hidden)
     else:
         policy = GaussianPolicy(embedding_dim, act_dim, hidden_dim=args.hidden_dim, n_hidden=args.n_hidden)
-    
-    # [MODIFIED] 4. 评估逻辑更新
-    # 我们需要构建一个包含 Encoder 的 Policy Wrapper 给 evaluate_policy 使用
-    eval_agent = MaskedPolicyWrapper(iql.encoder, policy)
-    
-    def eval_policy():
-        # 这里进行标准评估 (Mask Rate = 0)
-        # 如果你想做 Attack 实验，可以修改 evaluate_policy 函数支持传入 mask
-        eval_returns = np.array([evaluate_policy(env, eval_agent, args.max_episode_steps) \
-                                 for _ in range(args.n_eval_episodes)])
-        normalized_returns = d4rl.get_normalized_score(args.env_name, eval_returns) * 100.0
         
-        # 获取 iql update 返回的 loss 字典（需要稍微改一下 train loop 获取 loss）
-        log.row({
-            'return mean': eval_returns.mean(),
-            'return std': eval_returns.std(),
-            'normalized return mean': normalized_returns.mean(),
-            'normalized return std': normalized_returns.std(),
-        })
-
      # [MODIFIED] 3. 初始化 IQL agent
     iql = ImplicitQLearning(
         qf=TwinQ(embedding_dim, act_dim, hidden_dim=args.hidden_dim, n_hidden=args.n_hidden),
@@ -97,6 +103,24 @@ def main(args):
         mask_prob=args.mask_prob,
         recon_weight=args.recon_weight
     )
+
+    # 我们需要构建一个包含 Encoder 的 Policy Wrapper 给 evaluate_policy 使用
+    eval_agent = MaskedPolicyWrapper(iql.encoder, policy)
+    
+    def eval_policy():
+        # 这里进行标准评估 (Mask Rate = 0)
+        # 如果你想做 Attack 实验，可以修改 evaluate_policy 函数支持传入 mask
+        eval_returns = np.array([evaluate_policy(env, eval_agent, args.max_episode_steps) \
+                                 for _ in range(args.n_eval_episodes)])
+        normalized_returns = d4rl.get_normalized_score(args.env_name, eval_returns) * 100.0
+        
+        # 获取 iql update 返回的 loss 字典（需要稍微改一下 train loop 获取 loss）
+        log.row({
+            'return mean': eval_returns.mean(),
+            'return std': eval_returns.std(),
+            'normalized return mean': normalized_returns.mean(),
+            'normalized return std': normalized_returns.std(),
+        })
 
     # === [NEW] Pre-training Phase ===
     print("Starting Encoder Pre-training...")
@@ -142,7 +166,12 @@ def main(args):
             print(f"Step {step}: Recon Loss = {loss_dict['loss/recon']:.6f}")
             eval_policy()
 
-    torch.save(iql.state_dict(), log.dir/'final.pt')
+    save_dict = {
+        'model_state': iql.state_dict(),
+        'obs_mean': obs_mean,
+        'obs_std': obs_std
+    }
+    torch.save(save_dict, log.dir/'final.pt')
     log.close()
 
 
