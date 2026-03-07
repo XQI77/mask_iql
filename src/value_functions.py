@@ -26,3 +26,25 @@ class ValueFunction(nn.Module):
 
     def forward(self, state):
         return self.v(state)
+    
+# --- [NEW CODE START] Masked-IQL Components ---
+class StateEncoder(nn.Module):
+    def __init__(self, state_dim, embedding_dim=256, hidden_dim=256, n_hidden=2):
+        super().__init__()
+        # 使用 util.py 中的 mlp 构建，最后加一个 LayerNorm 增加训练稳定性
+        self.net = mlp([state_dim, *([hidden_dim] * n_hidden), embedding_dim])
+        self.ln = nn.LayerNorm(embedding_dim)
+
+    def forward(self, state):
+        z = self.net(state)
+        return self.ln(z)
+
+class StateDecoder(nn.Module):
+    def __init__(self, embedding_dim, state_dim, hidden_dim=256, n_hidden=2):
+        super().__init__()
+        # 输出层不需要激活函数，直接输出预测的状态值
+        self.net = mlp([embedding_dim, *([hidden_dim] * n_hidden), state_dim])
+
+    def forward(self, z):
+        return self.net(z)
+# --- [NEW CODE END] ---

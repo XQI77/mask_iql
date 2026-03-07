@@ -86,10 +86,18 @@ def sample_batch(dataset, batch_size):
     return {k: v[indices] for k, v in dataset.items()}
 
 
-def evaluate_policy(env, policy, max_episode_steps, deterministic=True):
+# 修改 evaluate_policy 以支持测试时攻击
+def evaluate_policy(env, policy, max_episode_steps, deterministic=True, attack_prob=0.0):
     obs = env.reset()
     total_reward = 0.
     for _ in range(max_episode_steps):
+        # === 攻击代码开始 ===
+        if attack_prob > 0:
+            # 模拟测试时传感器归零
+            mask = np.random.binomial(1, 1 - attack_prob, size=obs.shape)
+            obs = obs * mask
+        # === 攻击代码结束 ===
+        
         with torch.no_grad():
             action = policy.act(torchify(obs), deterministic=deterministic).cpu().numpy()
         next_obs, reward, done, info = env.step(action)

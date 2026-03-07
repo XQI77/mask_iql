@@ -29,6 +29,18 @@ def get_env_and_dataset(log, env_name, max_episode_steps):
 
     return env, dataset
 
+# [MODIFIED] 新增一个评估用的 Wrapper，把 Encoder 和 Policy 包装在一起
+class MaskedPolicyWrapper(torch.nn.Module):
+    def __init__(self, encoder, policy):
+        super().__init__()
+        self.encoder = encoder
+        self.policy = policy
+    
+    def act(self, obs, deterministic=False, enable_grad=False):
+        # 1. 编码
+        z = self.encoder(obs)
+        # 2. 决策
+        return self.policy.act(z, deterministic, enable_grad)
 
 def main(args):
     torch.set_num_threads(1)
@@ -40,14 +52,26 @@ def main(args):
     act_dim = dataset['actions'].shape[1]   # this assume continuous actions
     set_seed(args.seed, env=env)
 
+    # [MODIFIED] 1. 定义 Latent Dimension
+    embedding_dim = args.embedding_dim 
+
     if args.deterministic_policy:
-        policy = DeterministicPolicy(obs_dim, act_dim, hidden_dim=args.hidden_dim, n_hidden=args.n_hidden)
+        policy = DeterministicPolicy(embedding_dim, act_dim, hidden_dim=args.hidden_dim, n_hidden=args.n_hidden)
     else:
-        policy = GaussianPolicy(obs_dim, act_dim, hidden_dim=args.hidden_dim, n_hidden=args.n_hidden)
+        policy = GaussianPolicy(embedding_dim, act_dim, hidden_dim=args.hidden_dim, n_hidden=args.n_hidden)
+    
+    # [MODIFIED] 4. 评估逻辑更新
+    # 我们需要构建一个包含 Encoder 的 Policy Wrapper 给 evaluate_policy 使用
+    eval_agent = MaskedPolicyWrapper(iql.encoder, policy)
+    
     def eval_policy():
-        eval_returns = np.array([evaluate_policy(env, policy, args.max_episode_steps) \
+        # 这里进行标准评估 (Mask Rate = 0)
+        # 如果你想做 Attack 实验，可以修改 evaluate_policy 函数支持传入 mask
+        eval_returns = np.array([evaluate_policy(env, eval_agent, args.max_episode_steps) \
                                  for _ in range(args.n_eval_episodes)])
         normalized_returns = d4rl.get_normalized_score(args.env_name, eval_returns) * 100.0
+        
+        # 获取 iql update 返回的 loss 字典（需要稍微改一下 train loop 获取 loss）
         log.row({
             'return mean': eval_returns.mean(),
             'return std': eval_returns.std(),
@@ -55,21 +79,31 @@ def main(args):
             'normalized return std': normalized_returns.std(),
         })
 
+     # [MODIFIED] 3. 初始化 IQL agent
     iql = ImplicitQLearning(
-        qf=TwinQ(obs_dim, act_dim, hidden_dim=args.hidden_dim, n_hidden=args.n_hidden),
-        vf=ValueFunction(obs_dim, hidden_dim=args.hidden_dim, n_hidden=args.n_hidden),
+        qf=TwinQ(embedding_dim, act_dim, hidden_dim=args.hidden_dim, n_hidden=args.n_hidden),
+        vf=ValueFunction(embedding_dim, hidden_dim=args.hidden_dim, n_hidden=args.n_hidden),
         policy=policy,
         optimizer_factory=lambda params: torch.optim.Adam(params, lr=args.learning_rate),
         max_steps=args.n_steps,
         tau=args.tau,
         beta=args.beta,
         alpha=args.alpha,
-        discount=args.discount
+        discount=args.discount,
+        # 传入新参数
+        state_dim=obs_dim,
+        embedding_dim=embedding_dim,
+        mask_prob=args.mask_prob,
+        recon_weight=args.recon_weight
     )
 
     for step in trange(args.n_steps):
-        iql.update(**sample_batch(dataset, args.batch_size))
+        # [MODIFIED] 获取 loss 并 log（可选）
+        loss_dict = iql.update(**sample_batch(dataset, args.batch_size))
+        
         if (step+1) % args.eval_period == 0:
+            # 可以顺便打印一下 recon loss 看看有没有下降
+            print(f"Step {step}: Recon Loss = {loss_dict['loss/recon']:.6f}")
             eval_policy()
 
     torch.save(iql.state_dict(), log.dir/'final.pt')
@@ -95,4 +129,9 @@ if __name__ == '__main__':
     parser.add_argument('--eval-period', type=int, default=5000)
     parser.add_argument('--n-eval-episodes', type=int, default=10)
     parser.add_argument('--max-episode-steps', type=int, default=1000)
+
+    # [MODIFIED] 新增参数
+    parser.add_argument('--embedding-dim', type=int, default=256, help='Latent space dimension')
+    parser.add_argument('--mask-prob', type=float, default=0.3, help='Probability of masking a sensor')
+    parser.add_argument('--recon-weight', type=float, default=1.0, help='Weight for reconstruction loss')
     main(parser.parse_args())
