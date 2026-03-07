@@ -12,7 +12,25 @@ from src.policy import GaussianPolicy, DeterministicPolicy
 from src.value_functions import TwinQ, ValueFunction
 from src.util import return_range, set_seed, Log, sample_batch, torchify, evaluate_policy, NormalizedEnv
 
+class NormalizedEnv(gym.Wrapper):
+    def __init__(self, env, mean, std):
+        super().__init__(env)
+        # 确保 mean/std 是 numpy array
+        self.mean = mean.cpu().numpy() if torch.is_tensor(mean) else mean
+        self.std = std.cpu().numpy() if torch.is_tensor(std) else std
+        self.mean = self.mean.reshape(-1) # 展平
+        self.std = self.std.reshape(-1)
+        
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+        return (obs - self.mean) / self.std
 
+    def step(self, action):
+        next_obs, reward, done, info = self.env.step(action)
+        norm_next_obs = (next_obs - self.mean) / self.std
+        return norm_next_obs, reward, done, info
+    
+    
 def get_env_and_dataset(log, env_name, max_episode_steps):
     env = gym.make(env_name)
     dataset = d4rl.qlearning_dataset(env)
