@@ -4,6 +4,7 @@ import gym
 import d4rl
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import trange
 
 from src.iql import ImplicitQLearning
@@ -96,6 +97,41 @@ def main(args):
         mask_prob=args.mask_prob,
         recon_weight=args.recon_weight
     )
+
+    # === [NEW] Pre-training Phase ===
+    print("Starting Encoder Pre-training...")
+    # 预训练步数，通常 50k 足够
+    n_pretrain = 100000 
+    
+    # 确保 IQL 处于训练模式 (这样 generate_mask 才会生效)
+    iql.train()
+    
+    for _ in trange(n_pretrain, desc="Pre-training"):
+        # 1. 采样数据
+        batch = sample_batch(dataset, args.batch_size)
+        obs = batch['observations']
+        
+        # 2. 生成掩码并编码
+        # 注意：generate_mask 需要在 iql.py 中被定义为 public 方法
+        masked_obs, mask = iql.generate_mask(obs)
+        
+        # 3. 前向传播
+        z = iql.encoder(masked_obs)
+        recon = iql.decoder(z)
+        
+        # 4. 计算 Loss (使用 F.mse_loss)
+        loss = F.mse_loss(recon, obs)
+        
+        # 5. 反向传播更新
+        # 确保使用了 iql 对象中定义的优化器
+        iql.enc_opt.zero_grad()
+        iql.dec_opt.zero_grad()
+        loss.backward()
+        iql.enc_opt.step()
+        iql.dec_opt.step()
+        
+    print("Pre-training Finished. Starting RL Training...")
+    # ================================
 
     for step in trange(args.n_steps):
         # [MODIFIED] 获取 loss 并 log（可选）

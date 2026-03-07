@@ -61,82 +61,103 @@ class ImplicitQLearning(nn.Module):
         return state, torch.ones_like(state)
 
     def update(self, observations, actions, next_observations, rewards, terminals):
-        # [MODIFIED] === Step 1: 掩码与状态编码 (Representation Learning) ===
+        """
+        Masked-IQL Update Logic
+        Phase 1: Representation Learning (Reconstruction)
+        Phase 2: Reinforcement Learning (IQL with Fixed Features)
+        """
         
-        # 1.1 对当前状态应用 Mask
+        # =======================================================
+        # Phase 1: Representation Learning (Encoder & Decoder)
+        # =======================================================
+        
+        # 1. 生成掩码并构造残缺状态
+        # Generate mask and masked state
         masked_obs, mask = self.generate_mask(observations)
         
-        # 1.2 编码得到潜变量 z (用于当前步决策)
+        # 2. 编码 (Encode)
+        # z: [batch, embedding_dim]
         z = self.encoder(masked_obs)
         
-        # 1.3 重建原始状态 (Self-Supervised Task)
+        # 3. 解码与重建 (Decode & Reconstruct)
+        # 试图从 z 还原回完整的原始 observations
         recon_obs = self.decoder(z)
-        recon_loss = F.mse_loss(recon_obs, observations) # 目标是还原未 Mask 的原始 obs
+        
+        # 4. 计算重建 Loss
+        # 这里只计算 MSE，迫使 Encoder 学会利用传感器间的相关性补全信息
+        recon_loss = F.mse_loss(recon_obs, observations)
 
-        # 1.4 对 Next State 编码 (用于计算 Target Value)
-        # 策略选择：为了 Target 的稳定性，通常不对 Next State 做 mask，或者只做推理
-        with torch.no_grad():
-            # 这里的 Encoder 共享参数，但不传导梯度
-            z_next = self.encoder(next_observations)
-
-        # [MODIFIED] === Step 2: 更新 Encoder & Decoder ===
-        # 我们先更新这一部分，或者加到总 Loss 里。这里选择单独 step 清晰一些。
+        # 5. 更新 Encoder 和 Decoder
+        # 注意：我们在这里直接更新 Encoder，而不是等到后面。
+        # 这样 Encoder 的梯度完全由重建任务主导，不受 RL 噪音干扰。
         self.enc_opt.zero_grad()
         self.dec_opt.zero_grad()
-        (self.recon_weight * recon_loss).backward(retain_graph=True) # retain_graph 因为 z 还要给 RL 用
+        (recon_loss * self.recon_weight).backward()
+        self.enc_opt.step()
         self.dec_opt.step()
-        # 注意：Encoder 的梯度稍后会叠加 RL 的梯度一起更新，或者这里先 step。
-        # 为了让 Encoder 同时适配重建和 RL，我们通常把梯度累积。
-        # 这里简化处理：Encoder 已经在上面计算了重建梯度，待会 RL 梯度反向传播时会累加到 Encoder 上。
-        
-        # [MODIFIED] === Step 3: RL Update (使用 z 和 z_next 替代 obs 和 next_obs) ===
-        
-        with torch.no_grad():
-            target_q = self.q_target(z, actions) # 使用 z
-            next_v = self.vf(z_next)             # 使用 z_next
 
-        # Update value function
-        v = self.vf(z) # 使用 z
+        # =======================================================
+        # Phase 2: Reinforcement Learning (IQL)
+        # =======================================================
+
+        # [关键修改] Detach z!
+        # 我们希望 RL 策略去适应 Encoder 提取的特征，而不是去改变特征。
+        # 这样可以极大稳定训练过程，防止 "Feature Collapse"。
+        z_detached = z.detach()
+
+        # 预计算 Target Value 所需的 next_z
+        with torch.no_grad():
+            # 为了提供稳定的 TD Target，Next State 通常不进行 Mask
+            z_next = self.encoder(next_observations) 
+            target_q = self.q_target(z_detached, actions)
+            next_v = self.vf(z_next)
+
+        # --- Update Value Function (V) ---
+        v = self.vf(z_detached)
         adv = target_q - v
         v_loss = asymmetric_l2_loss(adv, self.tau)
+        
         self.v_optimizer.zero_grad(set_to_none=True)
-        v_loss.backward(retain_graph=True) 
+        v_loss.backward()
         self.v_optimizer.step()
 
-        # Update Q function
+        # --- Update Q Function (Critic) ---
         targets = rewards + (1. - terminals.float()) * self.discount * next_v.detach()
-        qs = self.qf.both(z, actions) # 使用 z
+        qs = self.qf.both(z_detached, actions)
         q_loss = sum(F.mse_loss(q, targets) for q in qs) / len(qs)
+        
         self.q_optimizer.zero_grad(set_to_none=True)
-        q_loss.backward(retain_graph=True)
+        q_loss.backward()
         self.q_optimizer.step()
 
-        # Update target Q network
+        # --- Update Target Q Network ---
         update_exponential_moving_average(self.q_target, self.qf, self.alpha)
 
-        # Update policy
+        # --- Update Policy (Actor) ---
         exp_adv = torch.exp(self.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
-        policy_out = self.policy(z) # 使用 z
+        policy_out = self.policy(z_detached)
+        
         if isinstance(policy_out, torch.distributions.Distribution):
             bc_losses = -policy_out.log_prob(actions)
         elif torch.is_tensor(policy_out):
+            if policy_out.shape != actions.shape:
+                 raise RuntimeError(f"Policy output shape {policy_out.shape} != actions shape {actions.shape}")
             bc_losses = torch.sum((policy_out - actions)**2, dim=1)
         else:
             raise NotImplementedError
+            
         policy_loss = torch.mean(exp_adv * bc_losses)
         
         self.policy_optimizer.zero_grad(set_to_none=True)
-        policy_loss.backward() # 这里的梯度会回传给 Encoder
+        policy_loss.backward()
         self.policy_optimizer.step()
         self.policy_lr_schedule.step()
-        
-        # 最后统一更新 Encoder (包含了 Recon 梯度 + V梯度 + Q梯度 + Policy梯度)
-        self.enc_opt.step() 
 
-        # 返回 Loss 方便 Log
         return {
             'loss/recon': recon_loss.item(),
             'loss/v': v_loss.item(),
             'loss/q': q_loss.item(),
-            'loss/policy': policy_loss.item()
+            'loss/policy': policy_loss.item(),
+            'value/mean': v.mean().item(),
+            'value/adv_mean': adv.mean().item()
         }
