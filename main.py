@@ -122,7 +122,8 @@ def main(args):
         embedding_dim=embedding_dim,
         mask_ratio_min=args.mask_ratio_min,
         mask_ratio_max=args.mask_ratio_max,
-        recon_weight=args.recon_weight
+        recon_weight=args.recon_weight,
+        alpha_consistency=args.alpha_consistency
     )
 
     # 我们需要构建一个包含 Encoder 的 Policy Wrapper 给 evaluate_policy 使用
@@ -220,4 +221,5 @@ if __name__ == '__main__':
     parser.add_argument('--mask-ratio-min', type=float, default=0.0, help='Min mask ratio for per-batch random sampling')
     parser.add_argument('--mask-ratio-max', type=float, default=0.5, help='Max mask ratio for per-batch random sampling')
     parser.add_argument('--recon-weight', type=float, default=1.0, help='Weight for reconstruction loss')
+    parser.add_argument('--alpha-consistency', type=float, default=0.5, help='Weight for consistency loss')
     main(parser.parse_args())

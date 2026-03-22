@@ -19,7 +19,7 @@ class ImplicitQLearning(nn.Module):
                  # [MODIFIED] 新增参数
                  state_dim=None, embedding_dim=256,
                  mask_ratio_min=0.0, mask_ratio_max=0.5,
-                 recon_weight=1.0):
+                 recon_weight=1.0, alpha_consistency=0.5):
         super().__init__()
 
         # [MODIFIED] 1. 初始化 Encoder 和 Decoder
@@ -28,6 +28,7 @@ class ImplicitQLearning(nn.Module):
         self.mask_ratio_min = mask_ratio_min
         self.mask_ratio_max = mask_ratio_max
         self.recon_weight = recon_weight
+        self.alpha_consistency = alpha_consistency
         
         # 注意：这里假设外部传入的 qf, vf, policy 已经将其 input_dim 设置为 embedding_dim 了
         self.encoder = StateEncoder(state_dim, embedding_dim).to(DEFAULT_DEVICE)
@@ -84,21 +85,24 @@ class ImplicitQLearning(nn.Module):
         # 2. 编码 (Encode): 传入原始状态和掩码
         # z: [batch, embedding_dim]
         z = self.encoder(observations, mask)
-        
+
+        # 2b. Consistency Loss：完整状态过编码器，作为单向约束目标
+        # 使用全1掩码，mask_token 不参与（无缺失维度）
+        z_full = self.encoder(observations, torch.ones_like(observations)).detach()
+        consistency_loss = F.mse_loss(z, z_full)
+
         # 3. 解码与重建 (Decode & Reconstruct)
         # 试图从 z 还原回完整的原始 observations
         recon_obs = self.decoder(z)
-        
-        # 4. 计算重建 Loss
-        # 这里只计算 MSE，迫使 Encoder 学会利用传感器间的相关性补全信息
+
+        # 4. 计算总的表征学习损失
         recon_loss = F.mse_loss(recon_obs, observations)
+        repr_loss = recon_loss * self.recon_weight + self.alpha_consistency * consistency_loss
 
         # 5. 更新 Encoder 和 Decoder
-        # 注意：我们在这里直接更新 Encoder，而不是等到后面。
-        # 这样 Encoder 的梯度完全由重建任务主导，不受 RL 噪音干扰。
         self.enc_opt.zero_grad()
         self.dec_opt.zero_grad()
-        (recon_loss * self.recon_weight).backward()
+        repr_loss.backward()
         self.enc_opt.step()
         self.dec_opt.step()
 
@@ -161,6 +165,7 @@ class ImplicitQLearning(nn.Module):
 
         return {
             'loss/recon': recon_loss.item(),
+            'loss/consistency': consistency_loss.item(),
             'loss/v': v_loss.item(),
             'loss/q': q_loss.item(),
             'loss/policy': policy_loss.item(),
