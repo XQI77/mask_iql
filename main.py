@@ -10,7 +10,7 @@ from tqdm import trange
 from src.iql import ImplicitQLearning
 from src.policy import GaussianPolicy, DeterministicPolicy
 from src.value_functions import TwinQ, ValueFunction
-from src.util import return_range, set_seed, Log, sample_batch, torchify, evaluate_policy, NormalizedEnv
+from src.util import return_range, set_seed, Log, sample_batch, torchify, evaluate_policy
 
 class NormalizedEnv(gym.Wrapper):
     def __init__(self, env, mean, std):
@@ -30,7 +30,7 @@ class NormalizedEnv(gym.Wrapper):
         norm_next_obs = (next_obs - self.mean) / self.std
         return norm_next_obs, reward, done, info
     
-    
+
 def get_env_and_dataset(log, env_name, max_episode_steps):
     env = gym.make(env_name)
     dataset = d4rl.qlearning_dataset(env)
@@ -75,8 +75,10 @@ class MaskedPolicyWrapper(torch.nn.Module):
         self.policy = policy
     
     def act(self, obs, deterministic=False, enable_grad=False):
+        # 评估时无掩码（全1），让 Encoder 感知到所有维度均可观测
+        mask = torch.ones_like(obs)
         # 1. 编码
-        z = self.encoder(obs)
+        z = self.encoder(obs, mask)
         # 2. 决策
         return self.policy.act(z, deterministic, enable_grad)
 
@@ -153,12 +155,11 @@ def main(args):
         batch = sample_batch(dataset, args.batch_size)
         obs = batch['observations']
         
-        # 2. 生成掩码并编码
-        # 注意：generate_mask 需要在 iql.py 中被定义为 public 方法
-        masked_obs, mask = iql.generate_mask(obs)
-        
+        # 2. 生成掩码（mask_token 填充和拼接在 Encoder 内部处理）
+        mask = iql.generate_mask(obs)
+
         # 3. 前向传播
-        z = iql.encoder(masked_obs)
+        z = iql.encoder(obs, mask)
         recon = iql.decoder(z)
         
         # 4. 计算 Loss (使用 F.mse_loss)

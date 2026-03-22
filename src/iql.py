@@ -52,13 +52,13 @@ class ImplicitQLearning(nn.Module):
         self.discount = discount
         self.alpha = alpha
 
-    # [MODIFIED] 新增：掩码生成函数
+    # [MODIFIED] 掩码生成函数：只返回 mask，掩码填充逻辑在 Encoder 内部处理
     def generate_mask(self, state):
         if self.training and self.mask_prob > 0:
             probs = torch.full_like(state, 1 - self.mask_prob)
             mask = torch.bernoulli(probs)
-            return state * mask, mask
-        return state, torch.ones_like(state)
+            return mask
+        return torch.ones_like(state)
 
     def update(self, observations, actions, next_observations, rewards, terminals):
         """
@@ -71,13 +71,12 @@ class ImplicitQLearning(nn.Module):
         # Phase 1: Representation Learning (Encoder & Decoder)
         # =======================================================
         
-        # 1. 生成掩码并构造残缺状态
-        # Generate mask and masked state
-        masked_obs, mask = self.generate_mask(observations)
-        
-        # 2. 编码 (Encode)
+        # 1. 生成掩码 (mask_token 填充和拼接在 Encoder 内部处理)
+        mask = self.generate_mask(observations)
+
+        # 2. 编码 (Encode): 传入原始状态和掩码
         # z: [batch, embedding_dim]
-        z = self.encoder(masked_obs)
+        z = self.encoder(observations, mask)
         
         # 3. 解码与重建 (Decode & Reconstruct)
         # 试图从 z 还原回完整的原始 observations
@@ -107,8 +106,8 @@ class ImplicitQLearning(nn.Module):
 
         # 预计算 Target Value 所需的 next_z
         with torch.no_grad():
-            # 为了提供稳定的 TD Target，Next State 通常不进行 Mask
-            z_next = self.encoder(next_observations) 
+            # 为了提供稳定的 TD Target，Next State 不进行 Mask（全1掩码）
+            z_next = self.encoder(next_observations, torch.ones_like(next_observations))
             target_q = self.q_target(z_detached, actions)
             next_v = self.vf(z_next)
 

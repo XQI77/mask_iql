@@ -31,12 +31,20 @@ class ValueFunction(nn.Module):
 class StateEncoder(nn.Module):
     def __init__(self, state_dim, embedding_dim=256, hidden_dim=256, n_hidden=2):
         super().__init__()
-        # 使用 util.py 中的 mlp 构建，最后加一个 LayerNorm 增加训练稳定性
-        self.net = mlp([state_dim, *([hidden_dim] * n_hidden), embedding_dim])
+        self.state_dim = state_dim
+        # Learnable mask token: 缺失维度用 mask_token 填充而非置零
+        self.mask_token = nn.Parameter(torch.zeros(state_dim))
+        # 输入为 [masked_state, M] 拼接，维度为 state_dim * 2
+        self.net = mlp([state_dim * 2, *([hidden_dim] * n_hidden), embedding_dim])
         self.ln = nn.LayerNorm(embedding_dim)
 
-    def forward(self, state):
-        z = self.net(state)
+    def forward(self, state, mask):
+        # mask: 1=可观测, 0=缺失
+        # 缺失维度用 mask_token 填充，而非置零
+        masked_state = state * mask + self.mask_token * (1 - mask)
+        # 拼接掩码矩阵作为额外输入，让网络感知哪些维度缺失
+        encoder_input = torch.cat([masked_state, mask], dim=-1)
+        z = self.net(encoder_input)
         return self.ln(z)
 
 class StateDecoder(nn.Module):
