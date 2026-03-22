@@ -10,7 +10,7 @@ from tqdm import trange
 from src.iql import ImplicitQLearning
 from src.policy import GaussianPolicy, DeterministicPolicy
 from src.value_functions import TwinQ, ValueFunction
-from src.util import return_range, set_seed, Log, sample_batch, torchify, evaluate_policy
+from src.util import return_range, set_seed, Log, sample_batch, torchify, evaluate_policy, build_window_dataset
 
 class NormalizedEnv(gym.Wrapper):
     def __init__(self, env, mean, std):
@@ -67,20 +67,46 @@ def get_env_and_dataset(log, env_name, max_episode_steps):
     # 注意：squeeze() 去掉多余的维度，变回 (obs_dim,)
     return env, dataset, obs_mean.squeeze(), obs_std.squeeze()
 
-# [MODIFIED] 新增一个评估用的 Wrapper，把 Encoder 和 Policy 包装在一起
+# [MODIFIED] 评估用 Wrapper：维护大小为 K 的历史 buffer，每步聚合后决策
 class MaskedPolicyWrapper(torch.nn.Module):
-    def __init__(self, encoder, policy):
+    def __init__(self, encoder, window_agg, policy, window_size):
         super().__init__()
-        self.encoder = encoder
-        self.policy = policy
-    
+        self.encoder     = encoder
+        self.window_agg  = window_agg
+        self.policy      = policy
+        self.window_size = window_size
+        self._buffer     = []   # list of (obs, mask) tensors
+
+    def reset(self):
+        """每局开始时清空历史 buffer"""
+        self._buffer = []
+
     def act(self, obs, deterministic=False, enable_grad=False):
-        # 评估时无掩码（全1），让 Encoder 感知到所有维度均可观测
+        # obs: (state_dim,) – 单步观测，评估时无掩码（全1）
         mask = torch.ones_like(obs)
-        # 1. 编码
-        z = self.encoder(obs, mask)
-        # 2. 决策
-        return self.policy.act(z, deterministic, enable_grad)
+        self._buffer.append((obs, mask))
+        if len(self._buffer) > self.window_size:
+            self._buffer = self._buffer[-self.window_size:]
+
+        state_dim = obs.shape[0]
+        device    = obs.device
+
+        # 构造窗口：不足 K 步时用零填充（零掩码 = 全部缺失）
+        z_list = []
+        for i in range(self.window_size):
+            buf_idx = i - (self.window_size - len(self._buffer))
+            if buf_idx < 0:
+                obs_k  = torch.zeros(state_dim, device=device)
+                mask_k = torch.zeros(state_dim, device=device)
+            else:
+                obs_k, mask_k = self._buffer[buf_idx]
+            z_list.append(self.encoder(obs_k, mask_k))
+
+        # 聚合：stack 成 (K, emb_dim)，再过 window_agg 得到 (emb_dim,)
+        z_window = torch.stack(z_list, dim=0)   # (K, emb_dim)
+        z_final  = self.window_agg(z_window)     # (emb_dim,)
+
+        return self.policy.act(z_final, deterministic, enable_grad)
 
 def main(args):
     torch.set_num_threads(1)
@@ -97,6 +123,11 @@ def main(args):
     obs_dim = dataset['observations'].shape[1]
     act_dim = dataset['actions'].shape[1]
     set_seed(args.seed, env=env)
+
+    # [MODIFIED] 预计算滑动窗口数据（只做一次，后续 sample_batch 自动返回）
+    log(f'Building window dataset (K={args.window_size})...')
+    dataset = build_window_dataset(dataset, args.window_size)
+    log(f'Window dataset built. window_observations shape: {dataset["window_observations"].shape}')
 
     # [MODIFIED] 1. 定义 Latent Dimension
     embedding_dim = args.embedding_dim 
@@ -123,11 +154,13 @@ def main(args):
         mask_ratio_min=args.mask_ratio_min,
         mask_ratio_max=args.mask_ratio_max,
         recon_weight=args.recon_weight,
-        alpha_consistency=args.alpha_consistency
+        alpha_consistency=args.alpha_consistency,
+        window_size=args.window_size,
+        agg_hidden_dim=args.agg_hidden_dim
     )
 
-    # 我们需要构建一个包含 Encoder 的 Policy Wrapper 给 evaluate_policy 使用
-    eval_agent = MaskedPolicyWrapper(iql.encoder, policy)
+    # 评估用 Wrapper：含历史 buffer，每步聚合后决策
+    eval_agent = MaskedPolicyWrapper(iql.encoder, iql.window_agg, policy, args.window_size)
     
     def eval_policy():
         # 这里进行标准评估 (Mask Rate = 0)
@@ -153,22 +186,27 @@ def main(args):
     iql.train()
     
     for _ in trange(n_pretrain, desc="Pre-training"):
-        # 1. 采样数据
-        batch = sample_batch(dataset, args.batch_size)
-        obs = batch['observations']
-        
-        # 2. 生成掩码（mask_token 填充和拼接在 Encoder 内部处理）
-        mask = iql.generate_mask(obs)
+        # 1. 采样窗口数据
+        batch        = sample_batch(dataset, args.batch_size)
+        obs          = batch['observations']            # (B, state_dim) 当前步
+        window_obs   = batch['window_observations']     # (B, K, state_dim)
+        window_valid = batch['window_valid']            # (B, K)
 
-        # 3. 前向传播
-        z = iql.encoder(obs, mask)
-        recon = iql.decoder(z)
-        
-        # 4. 计算 Loss (使用 F.mse_loss)
-        loss = F.mse_loss(recon, obs)
-        
-        # 5. 反向传播更新
-        # 确保使用了 iql 对象中定义的优化器
+        # 2. 窗口内每步独立掩码编码，取当前步 z_t 用于重建
+        K = args.window_size
+        z_list = []
+        for k in range(K):
+            obs_k   = window_obs[:, k, :]
+            valid_k = window_valid[:, k].unsqueeze(1)
+            mask_k  = iql.generate_mask(obs_k) * valid_k
+            z_list.append(iql.encoder(obs_k, mask_k))
+        z_t = z_list[-1]    # 当前步编码，用于重建
+
+        # 3. 重建当前步状态
+        recon = iql.decoder(z_t)
+        loss  = F.mse_loss(recon, obs)
+
+        # 4. 反向传播（enc_opt 包含 encoder + window_agg）
         iql.enc_opt.zero_grad()
         iql.dec_opt.zero_grad()
         loss.backward()
@@ -222,4 +260,6 @@ if __name__ == '__main__':
     parser.add_argument('--mask-ratio-max', type=float, default=0.5, help='Max mask ratio for per-batch random sampling')
     parser.add_argument('--recon-weight', type=float, default=1.0, help='Weight for reconstruction loss')
     parser.add_argument('--alpha-consistency', type=float, default=0.5, help='Weight for consistency loss')
+    parser.add_argument('--window-size', type=int, default=5, help='Sliding window size K')
+    parser.add_argument('--agg-hidden-dim', type=int, default=256, help='Hidden dim of window aggregator MLP')
     main(parser.parse_args())

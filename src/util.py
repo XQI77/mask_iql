@@ -86,8 +86,70 @@ def sample_batch(dataset, batch_size):
     return {k: v[indices] for k, v in dataset.items()}
 
 
+def build_window_dataset(dataset, window_size):
+    """
+    Pre-compute sliding window observations from the dataset.
+    Respects trajectory boundaries (terminals / timeouts); out-of-bound steps
+    are zero-padded with a corresponding zero validity mask.
+
+    Adds two keys to the dataset in-place and returns it:
+      'window_observations': (N, K, state_dim) – per-window raw observations
+      'window_valid':        (N, K)            – 1.0 = real step, 0.0 = padded
+    """
+    observations = dataset['observations']          # (N, state_dim)
+    N, state_dim = observations.shape
+    device = observations.device
+
+    # Trajectory boundaries: terminal=1 OR timeout=1 ends a trajectory
+    is_boundary = dataset['terminals'].bool()
+    if 'timeouts' in dataset:
+        is_boundary = is_boundary | dataset['timeouts'].bool()
+
+    # Indices where new trajectories begin (index 0 always starts one)
+    boundary_indices = torch.where(is_boundary)[0]
+    traj_starts = torch.cat([
+        torch.tensor([0], dtype=torch.long, device=device),
+        (boundary_indices + 1).long()
+    ])
+    traj_starts = traj_starts[traj_starts < N]      # guard against last-step terminal
+
+    # For each step i: which trajectory does it belong to?
+    # traj_id[i] = largest j s.t. traj_starts[j] <= i  (via searchsorted)
+    all_idx_f = torch.arange(N, dtype=torch.float32, device=device)
+    traj_id = torch.searchsorted(
+        traj_starts.float().contiguous(), all_idx_f.contiguous(), right=True
+    ) - 1
+    traj_id = traj_id.long().clamp(min=0)
+
+    # Position of step i within its trajectory
+    traj_pos = torch.arange(N, device=device) - traj_starts[traj_id]
+
+    # Build window tensors
+    window_obs   = torch.zeros(N, window_size, state_dim,
+                               dtype=observations.dtype, device=device)
+    window_valid = torch.zeros(N, window_size,
+                               dtype=observations.dtype, device=device)
+
+    for k in range(window_size):
+        # window[:, k, :] = observation at step  t - (K-1-k)
+        # k=0 → oldest (t-K+1),  k=K-1 → current (t)
+        offset = window_size - 1 - k
+        valid = (traj_pos >= offset)                          # (N,) bool
+        src_idx = (torch.arange(N, device=device) - offset).clamp(min=0)
+        window_obs[:, k, :] = observations[src_idx]
+        window_obs[~valid, k, :] = 0.0                       # zero-pad invalid steps
+        window_valid[:, k] = valid.float()
+
+    dataset['window_observations'] = window_obs    # (N, K, state_dim)
+    dataset['window_valid']        = window_valid  # (N, K)
+    return dataset
+
+
 # 修改 evaluate_policy 以支持测试时攻击
 def evaluate_policy(env, policy, max_episode_steps, deterministic=True, attack_prob=0.0):
+    # 重置历史 buffer（支持带窗口的 policy wrapper）
+    if hasattr(policy, 'reset'):
+        policy.reset()
     obs = env.reset()
     total_reward = 0.
     for _ in range(max_episode_steps):

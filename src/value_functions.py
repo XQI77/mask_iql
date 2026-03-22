@@ -55,4 +55,22 @@ class StateDecoder(nn.Module):
 
     def forward(self, z):
         return self.net(z)
+
+
+class WindowAggregator(nn.Module):
+    """
+    将滑动窗口内 K 步的隐变量拼接后，映射回 embedding_dim。
+    输入: (batch, K, embedding_dim)  或  (K, embedding_dim)（单样本）
+    输出: (batch, embedding_dim)     或  (embedding_dim,)
+    """
+    def __init__(self, window_size, embedding_dim, hidden_dim=256):
+        super().__init__()
+        self.net = mlp([window_size * embedding_dim, hidden_dim, embedding_dim])
+        self.ln  = nn.LayerNorm(embedding_dim)
+
+    def forward(self, z_window):
+        # z_window: (..., K, embedding_dim)
+        leading = z_window.shape[:-2]           # 可能为空（单样本）或 (batch,)
+        z_flat  = z_window.reshape(*leading, -1)
+        return self.ln(self.net(z_flat))
 # --- [NEW CODE END] ---
