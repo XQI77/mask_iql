@@ -17,14 +17,16 @@ class ImplicitQLearning(nn.Module):
     def __init__(self, qf, vf, policy, optimizer_factory, max_steps,
                  tau, beta, discount=0.99, alpha=0.005,
                  # [MODIFIED] 新增参数
-                 state_dim=None, embedding_dim=256, 
-                 mask_prob=0.3, recon_weight=1.0):
+                 state_dim=None, embedding_dim=256,
+                 mask_ratio_min=0.0, mask_ratio_max=0.5,
+                 recon_weight=1.0):
         super().__init__()
-        
+
         # [MODIFIED] 1. 初始化 Encoder 和 Decoder
         self.state_dim = state_dim
         self.embedding_dim = embedding_dim
-        self.mask_prob = mask_prob
+        self.mask_ratio_min = mask_ratio_min
+        self.mask_ratio_max = mask_ratio_max
         self.recon_weight = recon_weight
         
         # 注意：这里假设外部传入的 qf, vf, policy 已经将其 input_dim 设置为 embedding_dim 了
@@ -54,9 +56,14 @@ class ImplicitQLearning(nn.Module):
 
     # [MODIFIED] 掩码生成函数：只返回 mask，掩码填充逻辑在 Encoder 内部处理
     def generate_mask(self, state):
-        if self.training and self.mask_prob > 0:
-            probs = torch.full_like(state, 1 - self.mask_prob)
-            mask = torch.bernoulli(probs)
+        if self.training and self.mask_ratio_max > 0:
+            # per-batch 随机采样掩码比例 p ~ U(mask_ratio_min, mask_ratio_max)
+            # 当 min == max 时退化为固定比例
+            if self.mask_ratio_min == self.mask_ratio_max:
+                p = self.mask_ratio_min
+            else:
+                p = torch.empty(1).uniform_(self.mask_ratio_min, self.mask_ratio_max).item()
+            mask = torch.bernoulli(torch.ones_like(state) * (1 - p))
             return mask
         return torch.ones_like(state)
 
