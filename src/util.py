@@ -153,15 +153,18 @@ def evaluate_policy(env, policy, max_episode_steps, deterministic=True, attack_p
     obs = env.reset()
     total_reward = 0.
     for _ in range(max_episode_steps):
-        # === 攻击代码开始 ===
         if attack_prob > 0:
-            # 模拟测试时传感器归零
             mask = np.random.binomial(1, 1 - attack_prob, size=obs.shape)
-            obs = obs * mask
-        # === 攻击代码结束 ===
-        
+        else:
+            mask = np.ones_like(obs)
+
+        # 关键修复：传入原始 obs（不在外部置零）和 mask，由 encoder 内部用 mask_token 填充
         with torch.no_grad():
-            action = policy.act(torchify(obs), deterministic=deterministic).cpu().numpy()
+            action = policy.act(
+                torchify(obs),
+                deterministic=deterministic,
+                mask=torchify(mask.astype(np.float32))
+            ).cpu().numpy()
         next_obs, reward, done, info = env.step(action)
         total_reward += reward
         if done:

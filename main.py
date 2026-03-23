@@ -81,9 +81,10 @@ class MaskedPolicyWrapper(torch.nn.Module):
         """每局开始时清空历史 buffer"""
         self._buffer = []
 
-    def act(self, obs, deterministic=False, enable_grad=False):
-        # obs: (state_dim,) – 单步观测，评估时无掩码（全1）
-        mask = torch.ones_like(obs)
+    def act(self, obs, deterministic=False, enable_grad=False, mask=None):
+        # 如果外部传入了 mask 就用外部的，否则默认全 1（完全观测）
+        if mask is None:
+            mask = torch.ones_like(obs)
         self._buffer.append((obs, mask))
         if len(self._buffer) > self.window_size:
             self._buffer = self._buffer[-self.window_size:]
@@ -192,7 +193,7 @@ def main(args):
         window_obs   = batch['window_observations']     # (B, K, state_dim)
         window_valid = batch['window_valid']            # (B, K)
 
-        # 2. 窗口内每步独立掩码编码，取当前步 z_t 用于重建
+        # 2. 窗口内每步独立掩码编码
         K = args.window_size
         z_list = []
         for k in range(K):
@@ -200,10 +201,13 @@ def main(args):
             valid_k = window_valid[:, k].unsqueeze(1)
             mask_k  = iql.generate_mask(obs_k) * valid_k
             z_list.append(iql.encoder(obs_k, mask_k))
-        z_t = z_list[-1]    # 当前步编码，用于重建
+
+        # 关键修复：通过 window_agg 聚合后再重建，让梯度流过 window_agg
+        z_window = torch.stack(z_list, dim=1)   # (B, K, emb_dim)
+        z_final  = iql.window_agg(z_window)     # (B, emb_dim)
 
         # 3. 重建当前步状态
-        recon = iql.decoder(z_t)
+        recon = iql.decoder(z_final)
         loss  = F.mse_loss(recon, obs)
 
         # 4. 反向传播（enc_opt 包含 encoder + window_agg）

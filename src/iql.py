@@ -133,10 +133,13 @@ class ImplicitQLearning(nn.Module):
         z_detached = z_final.detach()
 
         with torch.no_grad():
-            # Next state: single-step encoding (no mask) for stable TD target
-            z_next   = self.encoder(next_observations, torch.ones_like(next_observations))
+            # Next state: 单步编码后构造伪窗口，保证特征分布与 z_final 一致
+            z_next_single = self.encoder(next_observations, torch.ones_like(next_observations))
+            # 关键修复：将单步特征复制 K 次作为窗口，让 z_next 也过 window_agg
+            z_next_window = z_next_single.unsqueeze(1).expand(-1, self.window_size, -1)  # (B, K, emb)
+            z_next_agg    = self.window_agg(z_next_window)  # (B, emb)
             target_q = self.q_target(z_detached, actions)
-            next_v   = self.vf(z_next)
+            next_v   = self.vf(z_next_agg)
 
         # --- Update Value Function (V) ---
         v   = self.vf(z_detached)
