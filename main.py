@@ -178,47 +178,7 @@ def main(args):
             'normalized return std': normalized_returns.std(),
         })
 
-    # === [NEW] Pre-training Phase ===
-    print("Starting Encoder Pre-training...")
-    # 预训练步数，通常 50k 足够
-    n_pretrain = 100000 
-    
-    # 确保 IQL 处于训练模式 (这样 generate_mask 才会生效)
     iql.train()
-    
-    for _ in trange(n_pretrain, desc="Pre-training"):
-        # 1. 采样窗口数据
-        batch        = sample_batch(dataset, args.batch_size)
-        obs          = batch['observations']            # (B, state_dim) 当前步
-        window_obs   = batch['window_observations']     # (B, K, state_dim)
-        window_valid = batch['window_valid']            # (B, K)
-
-        # 2. 窗口内每步独立掩码编码
-        K = args.window_size
-        z_list = []
-        for k in range(K):
-            obs_k   = window_obs[:, k, :]
-            valid_k = window_valid[:, k].unsqueeze(1)
-            mask_k  = iql.generate_mask(obs_k) * valid_k
-            z_list.append(iql.encoder(obs_k, mask_k))
-
-        # 关键修复：通过 window_agg 聚合后再重建，让梯度流过 window_agg
-        z_window = torch.stack(z_list, dim=1)   # (B, K, emb_dim)
-        z_final  = iql.window_agg(z_window)     # (B, emb_dim)
-
-        # 3. 重建当前步状态
-        recon = iql.decoder(z_final)
-        loss  = F.mse_loss(recon, obs)
-
-        # 4. 反向传播（enc_opt 包含 encoder + window_agg）
-        iql.enc_opt.zero_grad()
-        iql.dec_opt.zero_grad()
-        loss.backward()
-        iql.enc_opt.step()
-        iql.dec_opt.step()
-        
-    print("Pre-training Finished. Starting RL Training...")
-    # ================================
 
     for step in trange(args.n_steps):
         # [MODIFIED] 获取 loss 并 log（可选）

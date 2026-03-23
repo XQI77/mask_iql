@@ -129,20 +129,24 @@ class ImplicitQLearning(nn.Module):
         # Phase 2: Reinforcement Learning (IQL)
         # =======================================================
 
-        # RL uses z_final (window-aggregated); detach to prevent feature collapse
-        z_detached = z_final.detach()
-
+        # 关键修复：RL 使用 FULL STATE 编码，不使用 masked 的 z_final
+        # 这保证 current state 和 next state 经过完全一致的编码路径
         with torch.no_grad():
-            # Next state: 单步编码后构造伪窗口，保证特征分布与 z_final 一致
+            # current state: 用完整观测编码（与 consistency target 路径一致）
+            z_full_single = self.encoder(observations, torch.ones_like(observations))
+            z_full_window_rl = z_full_single.unsqueeze(1).expand(-1, self.window_size, -1)
+            z_for_rl = self.window_agg(z_full_window_rl)  # (B, emb_dim)
+
+            # next state: 同样用完整观测编码
             z_next_single = self.encoder(next_observations, torch.ones_like(next_observations))
-            # 关键修复：将单步特征复制 K 次作为窗口，让 z_next 也过 window_agg
-            z_next_window = z_next_single.unsqueeze(1).expand(-1, self.window_size, -1)  # (B, K, emb)
-            z_next_agg    = self.window_agg(z_next_window)  # (B, emb)
-            target_q = self.q_target(z_detached, actions)
+            z_next_window = z_next_single.unsqueeze(1).expand(-1, self.window_size, -1)
+            z_next_agg = self.window_agg(z_next_window)    # (B, emb_dim)
+
+            target_q = self.q_target(z_for_rl, actions)
             next_v   = self.vf(z_next_agg)
 
         # --- Update Value Function (V) ---
-        v   = self.vf(z_detached)
+        v   = self.vf(z_for_rl)
         adv = target_q - v
         v_loss = asymmetric_l2_loss(adv, self.tau)
 
@@ -152,7 +156,7 @@ class ImplicitQLearning(nn.Module):
 
         # --- Update Q Function (Critic) ---
         targets = rewards + (1. - terminals.float()) * self.discount * next_v.detach()
-        qs      = self.qf.both(z_detached, actions)
+        qs      = self.qf.both(z_for_rl, actions)
         q_loss  = sum(F.mse_loss(q, targets) for q in qs) / len(qs)
 
         self.q_optimizer.zero_grad(set_to_none=True)
@@ -164,7 +168,7 @@ class ImplicitQLearning(nn.Module):
 
         # --- Update Policy (Actor) ---
         exp_adv    = torch.exp(self.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
-        policy_out = self.policy(z_detached)
+        policy_out = self.policy(z_for_rl)
 
         if isinstance(policy_out, torch.distributions.Distribution):
             bc_losses = -policy_out.log_prob(actions)
