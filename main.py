@@ -144,7 +144,7 @@ def main(args):
         vf=ValueFunction(embedding_dim, hidden_dim=args.hidden_dim, n_hidden=args.n_hidden),
         policy=policy,
         optimizer_factory=lambda params: torch.optim.Adam(params, lr=args.learning_rate),
-        max_steps=args.n_steps,
+        max_steps=args.n_steps - args.warmup_steps,
         tau=args.tau,
         beta=args.beta,
         alpha=args.alpha,
@@ -161,8 +161,8 @@ def main(args):
     )
 
     # 评估用 Wrapper：含历史 buffer，每步聚合后决策
+    # 冻结后在线 encoder 与 EMA 一致，直接使用在线 encoder
     eval_agent = MaskedPolicyWrapper(iql.encoder, iql.window_agg, policy, args.window_size)
-    
     def eval_policy():
         # 这里进行标准评估 (Mask Rate = 0)
         # 如果你想做 Attack 实验，可以修改 evaluate_policy 函数支持传入 mask
@@ -180,14 +180,24 @@ def main(args):
 
     iql.train()
 
+    encoder_frozen = False
     for step in trange(args.n_steps):
-        # [MODIFIED] 获取 loss 并 log（可选）
-        loss_dict = iql.update(**sample_batch(dataset, args.batch_size))
-        
+        is_warmup = (step < args.warmup_steps)
+
+        # 方案A: warmup 结束时冻结 encoder，进入 Phase 2
+        if not is_warmup and not encoder_frozen:
+            iql._freeze_representation()
+            encoder_frozen = True
+            print(f"\n=== Step {step}: Encoder frozen, entering Phase 2 (RL only) ===")
+
+        loss_dict = iql.update(**sample_batch(dataset, args.batch_size), warmup=is_warmup)
+
         if (step+1) % args.eval_period == 0:
-            # 可以顺便打印一下 recon loss 看看有没有下降
-            print(f"Step {step}: Recon Loss = {loss_dict['loss/recon']:.6f}")
-            eval_policy()
+            if is_warmup:
+                print(f"Step {step}: [WARMUP] Recon Loss = {loss_dict['loss/recon']:.6f}")
+            else:
+                print(f"Step {step}: Recon Loss = {loss_dict['loss/recon']:.6f}")
+                eval_policy()
 
     save_dict = {
         'model_state': iql.state_dict(),
@@ -226,4 +236,5 @@ if __name__ == '__main__':
     parser.add_argument('--alpha-consistency', type=float, default=0.5, help='Weight for consistency loss')
     parser.add_argument('--window-size', type=int, default=5, help='Sliding window size K')
     parser.add_argument('--agg-hidden-dim', type=int, default=256, help='Hidden dim of window aggregator MLP')
+    parser.add_argument('--warmup-steps', type=int, default=50000, help='Number of warmup steps for encoder pretraining')
     main(parser.parse_args())

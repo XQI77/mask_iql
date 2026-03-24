@@ -37,6 +37,10 @@ class ImplicitQLearning(nn.Module):
         self.decoder     = StateDecoder(embedding_dim, state_dim).to(DEFAULT_DEVICE)
         self.window_agg  = WindowAggregator(window_size, embedding_dim, agg_hidden_dim).to(DEFAULT_DEVICE)
 
+        # EMA target networks for encoder and window_agg
+        self.encoder_ema    = copy.deepcopy(self.encoder).requires_grad_(False).to(DEFAULT_DEVICE)
+        self.window_agg_ema = copy.deepcopy(self.window_agg).requires_grad_(False).to(DEFAULT_DEVICE)
+
         self.qf = qf.to(DEFAULT_DEVICE)
         self.q_target = copy.deepcopy(qf).requires_grad_(False).to(DEFAULT_DEVICE)
         self.vf = vf.to(DEFAULT_DEVICE)
@@ -58,6 +62,15 @@ class ImplicitQLearning(nn.Module):
         self.discount = discount
         self.alpha = alpha
 
+    def _freeze_representation(self):
+        """Phase 1 结束后冻结 encoder、decoder、window_agg 的参数"""
+        for module in [self.encoder, self.decoder, self.window_agg]:
+            for param in module.parameters():
+                param.requires_grad_(False)
+        # 同步 EMA 到冻结后的 encoder/window_agg 最终状态
+        self.encoder_ema.load_state_dict(self.encoder.state_dict())
+        self.window_agg_ema.load_state_dict(self.window_agg.state_dict())
+
     # [MODIFIED] 掩码生成函数：只返回 mask，掩码填充逻辑在 Encoder 内部处理
     def generate_mask(self, state):
         if self.training and self.mask_ratio_max > 0:
@@ -72,7 +85,9 @@ class ImplicitQLearning(nn.Module):
         return torch.ones_like(state)
 
     def update(self, observations, actions, next_observations, rewards, terminals,
-               window_observations=None, window_valid=None):
+               window_observations=None, window_valid=None,
+               next_window_observations=None, next_window_valid=None,
+               warmup=False):
         """
         Masked-IQL Update Logic (with sliding-window history)
         Phase 1: Representation Learning (Reconstruction + Consistency)
@@ -84,63 +99,81 @@ class ImplicitQLearning(nn.Module):
         K = self.window_size
 
         # =======================================================
-        # Phase 1: Representation Learning (Encoder & Decoder)
+        # Phase 1: Representation Learning (仅在 warmup 阶段更新)
         # =======================================================
 
-        # --- Per-step encoding over the window (masked path) ---
-        z_list = []
-        for k in range(K):
-            obs_k   = window_observations[:, k, :]            # (batch, state_dim)
-            valid_k = window_valid[:, k].unsqueeze(1)         # (batch, 1)
-            # Random mask; padded steps forced to zero mask (all dims missing)
-            mask_k  = self.generate_mask(obs_k) * valid_k
-            z_list.append(self.encoder(obs_k, mask_k))
-
-        z_t      = z_list[-1]                                 # current-step z (for recon)
-        z_window = torch.stack(z_list, dim=1)                 # (batch, K, emb_dim)
-        z_final  = self.window_agg(z_window)                  # (batch, emb_dim)
-
-        # --- Consistency target: full-state window (no gradient) ---
-        with torch.no_grad():
-            z_full_list = []
+        if warmup:
+            # --- Per-step encoding over the window (masked path) ---
+            z_list = []
             for k in range(K):
-                obs_k    = window_observations[:, k, :]
-                valid_k  = window_valid[:, k].unsqueeze(1)
-                full_mask_k = torch.ones_like(obs_k) * valid_k   # 1 for real, 0 for padded
-                z_full_list.append(self.encoder(obs_k, full_mask_k))
-            z_full_window = torch.stack(z_full_list, dim=1)
-            z_full_agg    = self.window_agg(z_full_window)        # (batch, emb_dim)
+                obs_k   = window_observations[:, k, :]            # (batch, state_dim)
+                valid_k = window_valid[:, k].unsqueeze(1)         # (batch, 1)
+                mask_k  = self.generate_mask(obs_k) * valid_k
+                z_list.append(self.encoder(obs_k, mask_k))
 
-        consistency_loss = F.mse_loss(z_final, z_full_agg)
+            z_t      = z_list[-1]                                 # current-step z (for recon)
+            z_window = torch.stack(z_list, dim=1)                 # (batch, K, emb_dim)
+            z_final  = self.window_agg(z_window)                  # (batch, emb_dim)
 
-        # --- Reconstruction: current-step z_t → decoder → current obs ---
-        recon_obs  = self.decoder(z_t)
-        recon_loss = F.mse_loss(recon_obs, observations)
+            # --- 方案C: 一致性目标使用在线 encoder + stop-gradient（而非 EMA）---
+            with torch.no_grad():
+                z_full_list = []
+                for k in range(K):
+                    obs_k    = window_observations[:, k, :]
+                    valid_k  = window_valid[:, k].unsqueeze(1)
+                    full_mask_k = torch.ones_like(obs_k) * valid_k
+                    z_full_list.append(self.encoder(obs_k, full_mask_k))
+                z_full_window = torch.stack(z_full_list, dim=1)
+                z_full_agg    = self.window_agg(z_full_window)
 
-        repr_loss = recon_loss * self.recon_weight + self.alpha_consistency * consistency_loss
+            consistency_loss = F.mse_loss(z_final, z_full_agg)
 
-        self.enc_opt.zero_grad()
-        self.dec_opt.zero_grad()
-        repr_loss.backward()
-        self.enc_opt.step()
-        self.dec_opt.step()
+            # --- Reconstruction: current-step z_t → decoder → current obs ---
+            recon_obs  = self.decoder(z_t)
+            recon_loss = F.mse_loss(recon_obs, observations)
+
+            repr_loss = recon_loss * self.recon_weight + self.alpha_consistency * consistency_loss
+
+            self.enc_opt.zero_grad()
+            self.dec_opt.zero_grad()
+            repr_loss.backward()
+            self.enc_opt.step()
+            self.dec_opt.step()
+
+            # EMA update for encoder and window_agg
+            update_exponential_moving_average(self.encoder_ema, self.encoder, self.alpha)
+            update_exponential_moving_average(self.window_agg_ema, self.window_agg, self.alpha)
+
+            return {
+                'loss/recon': recon_loss.item(),
+                'loss/consistency': consistency_loss.item(),
+            }
 
         # =======================================================
-        # Phase 2: Reinforcement Learning (IQL)
+        # Phase 2: Reinforcement Learning (IQL, encoder 已冻结)
         # =======================================================
 
-        # 关键修复：RL 使用 FULL STATE 编码，不使用 masked 的 z_final
-        # 这保证 current state 和 next state 经过完全一致的编码路径
+        # 使用冻结的在线 encoder（参数不再更新，等价于固定特征提取器）
         with torch.no_grad():
-            # current state: 用完整观测编码（与 consistency target 路径一致）
-            z_full_single = self.encoder(observations, torch.ones_like(observations))
-            z_full_window_rl = z_full_single.unsqueeze(1).expand(-1, self.window_size, -1)
-            z_for_rl = self.window_agg(z_full_window_rl)  # (B, emb_dim)
+            # current state: 真实窗口，full mask
+            z_rl_list = []
+            for k in range(K):
+                obs_k = window_observations[:, k, :]
+                valid_k = window_valid[:, k].unsqueeze(1)
+                full_mask_k = torch.ones_like(obs_k) * valid_k
+                z_rl_list.append(self.encoder(obs_k, full_mask_k))
+            z_rl_window = torch.stack(z_rl_list, dim=1)
+            z_for_rl = self.window_agg(z_rl_window)
 
-            # next state: 同样用完整观测编码
-            z_next_single = self.encoder(next_observations, torch.ones_like(next_observations))
-            z_next_window = z_next_single.unsqueeze(1).expand(-1, self.window_size, -1)
-            z_next_agg = self.window_agg(z_next_window)    # (B, emb_dim)
+            # next state: 真实窗口，full mask
+            z_next_list = []
+            for k in range(K):
+                obs_k = next_window_observations[:, k, :]
+                valid_k = next_window_valid[:, k].unsqueeze(1)
+                full_mask_k = torch.ones_like(obs_k) * valid_k
+                z_next_list.append(self.encoder(obs_k, full_mask_k))
+            z_next_window = torch.stack(z_next_list, dim=1)
+            z_next_agg = self.window_agg(z_next_window)
 
             target_q = self.q_target(z_for_rl, actions)
             next_v   = self.vf(z_next_agg)
@@ -187,8 +220,8 @@ class ImplicitQLearning(nn.Module):
         self.policy_lr_schedule.step()
 
         return {
-            'loss/recon':       recon_loss.item(),
-            'loss/consistency': consistency_loss.item(),
+            'loss/recon':       0.0,  # Phase 2 不再训练 encoder
+            'loss/consistency': 0.0,
             'loss/v':           v_loss.item(),
             'loss/q':           q_loss.item(),
             'loss/policy':      policy_loss.item(),

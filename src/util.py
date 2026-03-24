@@ -142,6 +142,34 @@ def build_window_dataset(dataset, window_size):
 
     dataset['window_observations'] = window_obs    # (N, K, state_dim)
     dataset['window_valid']        = window_valid  # (N, K)
+
+    # --- Build next_window: the window that corresponds to next_observations[i] ---
+    # For step i: next_window = [window[i] slots 1..K-1, next_observations[i]]
+    # Exception: if step i is a trajectory boundary (terminal/timeout),
+    # next_observations[i] belongs to a new trajectory, so only the last slot is valid.
+    next_observations = dataset['next_observations']  # (N, state_dim)
+
+    next_window_obs   = torch.zeros(N, window_size, state_dim,
+                                     dtype=observations.dtype, device=device)
+    next_window_valid = torch.zeros(N, window_size,
+                                     dtype=observations.dtype, device=device)
+
+    # Default: shift window forward by 1 step
+    # Slots 0..K-2 come from window_obs slots 1..K-1 of current step
+    next_window_obs[:, :window_size-1, :]  = window_obs[:, 1:, :]
+    next_window_valid[:, :window_size-1]   = window_valid[:, 1:]
+    # Last slot is next_observations
+    next_window_obs[:, window_size-1, :]   = next_observations
+    next_window_valid[:, window_size-1]    = 1.0
+
+    # For boundary steps: next_obs belongs to a new trajectory,
+    # so the entire history is invalid — only the last slot (next_obs itself) is valid
+    boundary_mask = is_boundary  # (N,) bool
+    next_window_obs[boundary_mask, :window_size-1, :]  = 0.0
+    next_window_valid[boundary_mask, :window_size-1]   = 0.0
+
+    dataset['next_window_observations'] = next_window_obs    # (N, K, state_dim)
+    dataset['next_window_valid']        = next_window_valid  # (N, K)
     return dataset
 
 
