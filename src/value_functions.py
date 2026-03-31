@@ -57,30 +57,3 @@ class StateDecoder(nn.Module):
         return self.net(z)
 
 
-class WindowAggregator(nn.Module):
-    """
-    使用 GRU 聚合滑动窗口内 K 步的隐变量序列，取最终隐状态映射回 embedding_dim。
-    相比 MLP 展平拼接，GRU 能显式建模时序依赖，更适合部分可观测场景。
-    输入: (batch, K, embedding_dim)  或  (K, embedding_dim)（单样本）
-    输出: (batch, embedding_dim)     或  (embedding_dim,)
-    """
-    def __init__(self, window_size, embedding_dim, hidden_dim=256):
-        super().__init__()
-        self.gru  = nn.GRU(input_size=embedding_dim, hidden_size=hidden_dim,
-                           num_layers=1, batch_first=True)
-        self.proj = nn.Linear(hidden_dim, embedding_dim)
-        self.ln   = nn.LayerNorm(embedding_dim)
-
-    def forward(self, z_window):
-        # z_window: (K, embedding_dim) 单样本  或  (batch, K, embedding_dim)
-        is_single = z_window.dim() == 2
-        if is_single:
-            z_window = z_window.unsqueeze(0)          # (1, K, emb_dim)
-
-        _, h_n   = self.gru(z_window)                 # h_n: (1, batch, hidden_dim)
-        z_final  = self.proj(h_n.squeeze(0))          # (batch, emb_dim)
-        z_final  = self.ln(z_final)
-
-        if is_single:
-            z_final = z_final.squeeze(0)              # (emb_dim,)
-        return z_final
