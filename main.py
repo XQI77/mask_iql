@@ -12,6 +12,12 @@ from src.policy import GaussianPolicy, DeterministicPolicy
 from src.value_functions import TwinQ, ValueFunction
 from src.util import return_range, set_seed, Log, sample_batch, torchify, evaluate_policy, build_window_dataset
 
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+
 class NormalizedEnv(gym.Wrapper):
     def __init__(self, env, mean, std):
         super().__init__(env)
@@ -67,52 +73,36 @@ def get_env_and_dataset(log, env_name, max_episode_steps):
     # 注意：squeeze() 去掉多余的维度，变回 (obs_dim,)
     return env, dataset, obs_mean.squeeze(), obs_std.squeeze()
 
-# [MODIFIED] 评估用 Wrapper：维护大小为 K 的历史 buffer，每步聚合后决策
+# Phase2 评估用 Wrapper：直接单帧 obs → encoder → policy（与 Phase2 训练完全一致）
 class MaskedPolicyWrapper(torch.nn.Module):
-    def __init__(self, encoder, window_agg, policy, window_size):
+    def __init__(self, encoder, policy):
         super().__init__()
-        self.encoder     = encoder
-        self.window_agg  = window_agg
-        self.policy      = policy
-        self.window_size = window_size
-        self._buffer     = []   # list of (obs, mask) tensors
-
-    def reset(self):
-        """每局开始时清空历史 buffer"""
-        self._buffer = []
+        self.encoder = encoder
+        self.policy  = policy
 
     def act(self, obs, deterministic=False, enable_grad=False, mask=None):
-        # 如果外部传入了 mask 就用外部的，否则默认全 1（完全观测）
         if mask is None:
             mask = torch.ones_like(obs)
-        self._buffer.append((obs, mask))
-        if len(self._buffer) > self.window_size:
-            self._buffer = self._buffer[-self.window_size:]
-
-        state_dim = obs.shape[0]
-        device    = obs.device
-
-        # 构造窗口：不足 K 步时用零填充（零掩码 = 全部缺失）
-        z_list = []
-        for i in range(self.window_size):
-            buf_idx = i - (self.window_size - len(self._buffer))
-            if buf_idx < 0:
-                obs_k  = torch.zeros(state_dim, device=device)
-                mask_k = torch.zeros(state_dim, device=device)
-            else:
-                obs_k, mask_k = self._buffer[buf_idx]
-            z_list.append(self.encoder(obs_k, mask_k))
-
-        # 聚合：stack 成 (K, emb_dim)，再过 window_agg 得到 (emb_dim,)
-        z_window = torch.stack(z_list, dim=0)   # (K, emb_dim)
-        z_final  = self.window_agg(z_window)     # (emb_dim,)
-
-        return self.policy.act(z_final, deterministic, enable_grad)
+        z = self.encoder(obs, mask)
+        return self.policy.act(z, deterministic, enable_grad)
 
 def main(args):
     torch.set_num_threads(1)
     log = Log(Path(args.log_dir)/args.env_name, vars(args))
     log(f'Log dir: {log.dir}')
+
+    # --- W&B 初始化 ---
+    use_wandb = args.use_wandb and HAS_WANDB
+    if args.use_wandb and not HAS_WANDB:
+        log('WARNING: --use-wandb specified but wandb not installed. pip install wandb')
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=f'{args.env_name}_seed{args.seed}',
+            config=vars(args),
+            dir=str(log.dir),
+        )
+        log(f'W&B run: {wandb.run.url}')
 
     # [修改 1] 接收 mean 和 std
     env, dataset, obs_mean, obs_std = get_env_and_dataset(log, args.env_name, args.max_episode_steps)
@@ -160,23 +150,8 @@ def main(args):
         agg_hidden_dim=args.agg_hidden_dim
     )
 
-    # 评估用 Wrapper：含历史 buffer，每步聚合后决策
-    # 冻结后在线 encoder 与 EMA 一致，直接使用在线 encoder
-    eval_agent = MaskedPolicyWrapper(iql.encoder, iql.window_agg, policy, args.window_size)
-    def eval_policy():
-        # 这里进行标准评估 (Mask Rate = 0)
-        # 如果你想做 Attack 实验，可以修改 evaluate_policy 函数支持传入 mask
-        eval_returns = np.array([evaluate_policy(env, eval_agent, args.max_episode_steps) \
-                                 for _ in range(args.n_eval_episodes)])
-        normalized_returns = d4rl.get_normalized_score(args.env_name, eval_returns) * 100.0
-        
-        # 获取 iql update 返回的 loss 字典（需要稍微改一下 train loop 获取 loss）
-        log.row({
-            'return mean': eval_returns.mean(),
-            'return std': eval_returns.std(),
-            'normalized return mean': normalized_returns.mean(),
-            'normalized return std': normalized_returns.std(),
-        })
+    # 评估用 Wrapper：单帧 obs → encoder → policy（与 Phase2 训练特征一致）
+    eval_agent = MaskedPolicyWrapper(iql.encoder, policy)
 
     iql.train()
 
@@ -192,12 +167,57 @@ def main(args):
 
         loss_dict = iql.update(**sample_batch(dataset, args.batch_size), warmup=is_warmup)
 
+        # W&B: 每步记录（开销极低，wandb 内部会 batch 上传）
+        if use_wandb:
+            wandb.log(loss_dict, step=step)
+
         if (step+1) % args.eval_period == 0:
             if is_warmup:
-                print(f"Step {step}: [WARMUP] Recon Loss = {loss_dict['loss/recon']:.6f}")
+                print(f"Step {step}: [WARMUP] "
+                      f"Recon={loss_dict['loss/recon']:.6f} | "
+                      f"Consistency={loss_dict['loss/consistency']:.6f} | "
+                      f"MaskedMSE={loss_dict['encoder/masked_mse']:.6f} | "
+                      f"ObservedMSE={loss_dict['encoder/observed_mse']:.6f} | "
+                      f"CosSim={loss_dict['encoder/cosine_sim']:.4f} | "
+                      f"MaskRatio={loss_dict['encoder/mask_ratio']:.2f}")
+                log.row({
+                    'step': step,
+                    'phase': 'warmup',
+                    'loss/recon': loss_dict['loss/recon'],
+                    'loss/consistency': loss_dict['loss/consistency'],
+                    'encoder/masked_mse': loss_dict['encoder/masked_mse'],
+                    'encoder/observed_mse': loss_dict['encoder/observed_mse'],
+                    'encoder/cosine_sim': loss_dict['encoder/cosine_sim'],
+                    'encoder/mask_ratio': loss_dict['encoder/mask_ratio'],
+                })
             else:
-                print(f"Step {step}: Recon Loss = {loss_dict['loss/recon']:.6f}")
-                eval_policy()
+                print(f"Step {step}: "
+                      f"V={loss_dict['loss/v']:.4f} | "
+                      f"Q={loss_dict['loss/q']:.4f} | "
+                      f"Policy={loss_dict['loss/policy']:.4f} | "
+                      f"adv_mean={loss_dict['adv/mean']:.4f} | "
+                      f"adv_std={loss_dict['adv/std']:.4f} | "
+                      f"adv_frac+={loss_dict['adv/frac_positive']:.2f} | "
+                      f"exp_clipped={loss_dict['exp_adv/frac_clipped']:.2f} | "
+                      f"q1={loss_dict['q/q1_mean']:.4f} | "
+                      f"v={loss_dict['v/mean']:.4f}")
+                eval_returns = np.array([evaluate_policy(env, eval_agent, args.max_episode_steps) \
+                                         for _ in range(args.n_eval_episodes)])
+                normalized_returns = d4rl.get_normalized_score(args.env_name, eval_returns) * 100.0
+                eval_dict = {
+                    'return mean': eval_returns.mean(),
+                    'return std': eval_returns.std(),
+                    'normalized return mean': normalized_returns.mean(),
+                    'normalized return std': normalized_returns.std(),
+                }
+                log.row(eval_dict)
+                if use_wandb:
+                    wandb.log({
+                        'eval/return_mean': eval_returns.mean(),
+                        'eval/return_std': eval_returns.std(),
+                        'eval/normalized_return_mean': normalized_returns.mean(),
+                        'eval/normalized_return_std': normalized_returns.std(),
+                    }, step=step)
 
     save_dict = {
         'model_state': iql.state_dict(),
@@ -206,6 +226,8 @@ def main(args):
     }
     torch.save(save_dict, log.dir/'final.pt')
     log.close()
+    if use_wandb:
+        wandb.finish()
 
 
 if __name__ == '__main__':
@@ -237,4 +259,8 @@ if __name__ == '__main__':
     parser.add_argument('--window-size', type=int, default=5, help='Sliding window size K')
     parser.add_argument('--agg-hidden-dim', type=int, default=256, help='Hidden dim of window aggregator MLP')
     parser.add_argument('--warmup-steps', type=int, default=50000, help='Number of warmup steps for encoder pretraining')
+
+    # W&B
+    parser.add_argument('--use-wandb', action='store_true', help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb-project', type=str, default='masked-iql', help='W&B project name')
     main(parser.parse_args())

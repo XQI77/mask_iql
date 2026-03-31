@@ -242,11 +242,22 @@ class Log:
     def __call__(self, *args, **kwargs):
         self.write(*args, **kwargs)
 
+    def _open_csv(self, fieldnames, suffix=''):
+        fname = Path(self.csv_filename)
+        filename = fname.stem + suffix + fname.suffix
+        self.csv_file = open(self.dir/filename, 'w', newline='')
+        self.csv_writer = csv.DictWriter(self.csv_file, fieldnames)
+        self.csv_writer.writeheader()
+
     def row(self, dict):
         if self.csv_file is None:
-            self.csv_file = open(self.dir/self.csv_filename, 'w', newline='')
-            self.csv_writer = csv.DictWriter(self.csv_file, list(dict.keys()))
-            self.csv_writer.writeheader()
+            self._open_csv(list(dict.keys()))
+            self._csv_section = 1
+        elif any(k not in self.csv_writer.fieldnames for k in dict):
+            # Schema changed (e.g. warmup → RL eval): start a new CSV file
+            self.csv_file.close()
+            self._csv_section = getattr(self, '_csv_section', 1) + 1
+            self._open_csv(list(dict.keys()), suffix=f'_{self._csv_section}')
 
         self(str(dict))
         self.csv_writer.writerow(dict)

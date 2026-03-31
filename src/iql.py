@@ -10,6 +10,15 @@ from .util import DEFAULT_DEVICE, update_exponential_moving_average
 
 EXP_ADV_MAX = 100.
 
+#计算模型中所有参数梯度的 L2 范数
+def _grad_norm(model):
+    total = 0.
+    for p in model.parameters():
+        if p.grad is not None:
+            total += p.grad.data.norm(2).item() ** 2
+    return total ** 0.5
+
+# 非对称 L2 损失
 def asymmetric_l2_loss(u, tau):
     return torch.mean(torch.abs(tau - (u < 0).float()) * u**2)
 
@@ -144,9 +153,36 @@ class ImplicitQLearning(nn.Module):
             update_exponential_moving_average(self.encoder_ema, self.encoder, self.alpha)
             update_exponential_moving_average(self.window_agg_ema, self.window_agg, self.alpha)
 
+            # --- Encoder 评估指标（不参与梯度计算）---
+            with torch.no_grad():
+                # 当前步的 mask（最后一步窗口的 mask）
+                last_mask = self.generate_mask(observations) * window_valid[:, -1].unsqueeze(1)
+                per_dim_se = (recon_obs.detach() - observations) ** 2  # (batch, state_dim)
+
+                masked_dims = (1 - last_mask)   # 1=被遮盖的维度
+                observed_dims = last_mask        # 1=可观测的维度
+
+                # 仅在被遮盖维度上的 MSE
+                masked_count = masked_dims.sum()
+                masked_mse = (per_dim_se * masked_dims).sum() / masked_count.clamp(min=1)
+
+                # 仅在可观测维度上的 MSE
+                observed_count = observed_dims.sum()
+                observed_mse = (per_dim_se * observed_dims).sum() / observed_count.clamp(min=1)
+
+                # masked embedding 与 full embedding 的余弦相似度
+                cosine_sim = F.cosine_similarity(z_final, z_full_agg, dim=-1).mean()
+
+                # 实际平均 mask 比例（被遮盖维度占比）
+                mean_mask_ratio = masked_dims.mean()
+
             return {
                 'loss/recon': recon_loss.item(),
                 'loss/consistency': consistency_loss.item(),
+                'encoder/masked_mse': masked_mse.item(),
+                'encoder/observed_mse': observed_mse.item(),
+                'encoder/cosine_sim': cosine_sim.item(),
+                'encoder/mask_ratio': mean_mask_ratio.item(),
             }
 
         # =======================================================
@@ -155,25 +191,13 @@ class ImplicitQLearning(nn.Module):
 
         # 使用冻结的在线 encoder（参数不再更新，等价于固定特征提取器）
         with torch.no_grad():
-            # current state: 真实窗口，full mask
-            z_rl_list = []
-            for k in range(K):
-                obs_k = window_observations[:, k, :]
-                valid_k = window_valid[:, k].unsqueeze(1)
-                full_mask_k = torch.ones_like(obs_k) * valid_k
-                z_rl_list.append(self.encoder(obs_k, full_mask_k))
-            z_rl_window = torch.stack(z_rl_list, dim=1)
-            z_for_rl = self.window_agg(z_rl_window)
+            # current state: 单帧，full mask
+            full_mask   = torch.ones_like(observations)
+            z_for_rl    = self.encoder(observations, full_mask)
 
-            # next state: 真实窗口，full mask
-            z_next_list = []
-            for k in range(K):
-                obs_k = next_window_observations[:, k, :]
-                valid_k = next_window_valid[:, k].unsqueeze(1)
-                full_mask_k = torch.ones_like(obs_k) * valid_k
-                z_next_list.append(self.encoder(obs_k, full_mask_k))
-            z_next_window = torch.stack(z_next_list, dim=1)
-            z_next_agg = self.window_agg(z_next_window)
+            # next state: 单帧，full mask
+            full_mask_next = torch.ones_like(next_observations)
+            z_next_agg     = self.encoder(next_observations, full_mask_next)
 
             target_q = self.q_target(z_for_rl, actions)
             next_v   = self.vf(z_next_agg)
@@ -185,6 +209,8 @@ class ImplicitQLearning(nn.Module):
 
         self.v_optimizer.zero_grad(set_to_none=True)
         v_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.vf.parameters(), max_norm=10.0)
+        v_grad_norm = _grad_norm(self.vf)
         self.v_optimizer.step()
 
         # --- Update Q Function (Critic) ---
@@ -194,6 +220,8 @@ class ImplicitQLearning(nn.Module):
 
         self.q_optimizer.zero_grad(set_to_none=True)
         q_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.qf.parameters(), max_norm=10.0)
+        q_grad_norm = _grad_norm(self.qf)
         self.q_optimizer.step()
 
         # --- Update Target Q Network ---
@@ -216,15 +244,67 @@ class ImplicitQLearning(nn.Module):
 
         self.policy_optimizer.zero_grad(set_to_none=True)
         policy_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=10.0)
+        policy_grad_norm = _grad_norm(self.policy)
         self.policy_optimizer.step()
         self.policy_lr_schedule.step()
 
-        return {
-            'loss/recon':       0.0,  # Phase 2 不再训练 encoder
-            'loss/consistency': 0.0,
-            'loss/v':           v_loss.item(),
-            'loss/q':           q_loss.item(),
-            'loss/policy':      policy_loss.item(),
-            'value/mean':       v.mean().item(),
-            'value/adv_mean':   adv.mean().item()
+        # --- 诊断指标（不参与梯度计算）---
+        with torch.no_grad():
+            q1, q2 = qs[0].detach(), qs[1].detach()
+            td_error = (q1 - targets.detach()).abs()
+
+            # Policy 分布诊断
+            policy_diag = {}
+            if isinstance(policy_out, torch.distributions.Distribution):
+                policy_diag['policy/log_std_mean'] = self.policy.log_std.data.mean().item()
+                policy_diag['policy/log_std_min'] = self.policy.log_std.data.min().item()
+                policy_diag['policy/log_std_max'] = self.policy.log_std.data.max().item()
+                policy_diag['policy/entropy'] = policy_out.entropy().mean().item()
+                policy_diag['policy/action_mean_abs'] = policy_out.mean.abs().mean().item()
+            elif torch.is_tensor(policy_out):
+                policy_diag['policy/action_mean_abs'] = policy_out.detach().abs().mean().item()
+                policy_diag['policy/action_std'] = policy_out.detach().std(dim=0).mean().item()
+
+        diagnostics = {
+            # 损失
+            'loss/v':               v_loss.item(),
+            'loss/q':               q_loss.item(),
+            'loss/policy':          policy_loss.item(),
+            # Q 值分布
+            'q/q1_mean':            q1.mean().item(),
+            'q/q1_std':             q1.std().item(),
+            'q/q2_mean':            q2.mean().item(),
+            'q/target_q_mean':      target_q.mean().item(),
+            'q/target_q_std':       target_q.std().item(),
+            # V 值分布
+            'v/mean':               v.detach().mean().item(),
+            'v/std':                v.detach().std().item(),
+            'v/next_v_mean':        next_v.mean().item(),
+            # 优势函数（关键诊断）
+            'adv/mean':             adv.detach().mean().item(),
+            'adv/std':              adv.detach().std().item(),
+            'adv/min':              adv.detach().min().item(),
+            'adv/max':              adv.detach().max().item(),
+            'adv/frac_positive':    (adv.detach() > 0).float().mean().item(),
+            # exp_adv 截断率（关键诊断）
+            'exp_adv/mean':         exp_adv.mean().item(),
+            'exp_adv/max':          exp_adv.max().item(),
+            'exp_adv/frac_clipped': (exp_adv >= EXP_ADV_MAX).float().mean().item(),
+            # TD-error
+            'td/error_mean':        td_error.mean().item(),
+            'td/error_max':         td_error.max().item(),
+            # 梯度范数
+            'grad/v_norm':          v_grad_norm,
+            'grad/q_norm':          q_grad_norm,
+            'grad/policy_norm':     policy_grad_norm,
+            # Embedding 统计
+            'embed/z_mean':         z_for_rl.mean().item(),
+            'embed/z_std':          z_for_rl.std().item(),
+            'embed/z_norm':         z_for_rl.norm(dim=-1).mean().item(),
+            # Reward 统计（当前 batch）
+            'data/reward_mean':     rewards.mean().item(),
+            'data/reward_std':      rewards.std().item(),
         }
+        diagnostics.update(policy_diag)
+        return diagnostics
